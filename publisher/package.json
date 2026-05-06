@@ -1,0 +1,16 @@
+{
+  "name": "s4a-discovery-publisher",
+  "version": "1.0.0",
+  "description": "Publishes discovery.completed events to SAP Event Mesh",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "publish:valid": "node src/index.js --mode valid",
+    "publish:invalid": "node src/index.js --mode invalid",
+    "publish:bad-sink": "node src/index.js --mode bad-sink"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.5"
+  }
+}

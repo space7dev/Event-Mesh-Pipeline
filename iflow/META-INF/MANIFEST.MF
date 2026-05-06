@@ -1,0 +1,6 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: DiscoveryEventFlow
+Bundle-SymbolicName: DiscoveryEventFlow
+Bundle-Version: 1.0.0
+SAP-BundleType: IntegrationFlow

@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SAP Cloud Platform Integration — iFlow BPMN export
+  Integration Package : S4A Discovery Pipeline
+  iFlow ID            : DiscoveryEventFlow
+-->
+<bpmn2:definitions
+    xmlns:bpmn2="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+    xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+    xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+    xmlns:ifl="http:///com.sap.ifl.model/Ifl.xsd"
+    id="Definitions_DiscoveryEventFlow"
+    targetNamespace="http://www.sap.com/ifl">
+
+  <bpmn2:collaboration id="Collaboration_1">
+    <bpmn2:participant id="Participant_Integration" name="DiscoveryEventFlow"
+                       processRef="Process_Integration"/>
+    <bpmn2:participant id="Participant_EM_Source"   name="Event Mesh (Source)"
+                       ifl:componentType="EventMeshSender"/>
+    <bpmn2:participant id="Participant_Sink"        name="Discovery Sink"
+                       ifl:componentType="HTTPReceiver"/>
+    <bpmn2:participant id="Participant_DLQ"         name="Event Mesh (DLQ)"
+                       ifl:componentType="EventMeshReceiver"/>
+
+    <bpmn2:messageFlow id="MF_EMtoFlow"    sourceRef="Participant_EM_Source" targetRef="StartEvent_1"/>
+    <bpmn2:messageFlow id="MF_FlowToSink"  sourceRef="Task_HttpPost"         targetRef="Participant_Sink"/>
+    <bpmn2:messageFlow id="MF_FlowToDLQ"   sourceRef="Task_PublishDlq"       targetRef="Participant_DLQ"/>
+  </bpmn2:collaboration>
+
+  <bpmn2:process id="Process_Integration" isExecutable="true">
+
+    <!-- Start: Event Mesh webhook push -->
+    <bpmn2:startEvent id="StartEvent_1" name="discovery.completed received">
+      <bpmn2:outgoing>Flow_Start_to_HMAC</bpmn2:outgoing>
+      <bpmn2:messageEventDefinition/>
+    </bpmn2:startEvent>
+
+    <!-- Step 1: HMAC verification -->
+    <bpmn2:scriptTask id="Task_VerifyHmac" name="Verify HMAC Signature"
+                      scriptFormat="groovy"
+                      ifl:scriptName="verifyHmac.groovy">
+      <bpmn2:incoming>Flow_Start_to_HMAC</bpmn2:incoming>
+      <bpmn2:outgoing>Flow_HMAC_to_Schema</bpmn2:outgoing>
+    </bpmn2:scriptTask>
+
+    <!-- Step 2: Schema validation -->
+    <bpmn2:scriptTask id="Task_ValidateSchema" name="Validate JSON Schema"
+                      scriptFormat="groovy"
+                      ifl:scriptName="validateSchema.groovy">
+      <bpmn2:incoming>Flow_HMAC_to_Schema</bpmn2:incoming>
+      <bpmn2:outgoing>Flow_Schema_to_Enrich</bpmn2:outgoing>
+    </bpmn2:scriptTask>
+
+    <!-- Step 3: Enrich — UTC → Europe/Berlin -->
+    <bpmn2:scriptTask id="Task_EnrichPayload" name="Enrich scanTimestampCet"
+                      scriptFormat="groovy"
+                      ifl:scriptName="enrichPayload.groovy">
+      <bpmn2:incoming>Flow_Schema_to_Enrich</bpmn2:incoming>
+      <bpmn2:outgoing>Flow_Enrich_to_Post</bpmn2:outgoing>
+    </bpmn2:scriptTask>
+
+    <!-- Step 4: HTTP POST to sink -->
+    <bpmn2:serviceTask id="Task_HttpPost" name="HTTP POST → Sink"
+                       ifl:componentType="HTTPRequest">
+      <bpmn2:extensionElements>
+        <ifl:property>
+          <ifl:key>address</ifl:key>
+          <ifl:value>{{sink_url}}/events/discovery</ifl:value>
+        </ifl:property>
+        <ifl:property>
+          <ifl:key>method</ifl:key>
+          <ifl:value>POST</ifl:value>
+        </ifl:property>
+        <ifl:property>
+          <ifl:key>timeout</ifl:key>
+          <ifl:value>10000</ifl:value>
+        </ifl:property>
+        <!-- Authentication: Basic credential stored in CPI Security Material -->
+        <ifl:property>
+          <ifl:key>authenticationMethod</ifl:key>
+          <ifl:value>BasicAuthentication</ifl:value>
+        </ifl:property>
+        <ifl:property>
+          <ifl:key>credentialName</ifl:key>
+          <ifl:value>s4a_sink_credentials</ifl:value>
+        </ifl:property>
+      </bpmn2:extensionElements>
+      <bpmn2:incoming>Flow_Enrich_to_Post</bpmn2:incoming>
+      <bpmn2:outgoing>Flow_Post_to_End</bpmn2:outgoing>
+    </bpmn2:serviceTask>
+
+    <!-- Happy-path end -->
+    <bpmn2:endEvent id="EndEvent_Success" name="Forwarded OK">
+      <bpmn2:incoming>Flow_Post_to_End</bpmn2:incoming>
+    </bpmn2:endEvent>
+
+    <!-- ─── Sequence flows (happy path) ─── -->
+    <bpmn2:sequenceFlow id="Flow_Start_to_HMAC"      sourceRef="StartEvent_1"       targetRef="Task_VerifyHmac"/>
+    <bpmn2:sequenceFlow id="Flow_HMAC_to_Schema"     sourceRef="Task_VerifyHmac"    targetRef="Task_ValidateSchema"/>
+    <bpmn2:sequenceFlow id="Flow_Schema_to_Enrich"   sourceRef="Task_ValidateSchema" targetRef="Task_EnrichPayload"/>
+    <bpmn2:sequenceFlow id="Flow_Enrich_to_Post"     sourceRef="Task_EnrichPayload" targetRef="Task_HttpPost"/>
+    <bpmn2:sequenceFlow id="Flow_Post_to_End"        sourceRef="Task_HttpPost"       targetRef="EndEvent_Success"/>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         ERROR SUB-PROCESS — catches BoundaryError from Task_HttpPost
+         Implements exponential backoff: 3 attempts (1s, 2s, 4s) then DLQ
+         ═══════════════════════════════════════════════════════════════ -->
+    <bpmn2:subProcess id="SubProcess_RetryDLQ" name="Retry + DLQ"
+                      triggeredByEvent="true">
+
+      <!-- Catches HTTP errors (5xx) from the sink -->
+      <bpmn2:startEvent id="ErrorStart_Retry" name="Sink 5xx caught">
+        <bpmn2:outgoing>Flow_ErrStart_to_Backoff</bpmn2:outgoing>
+        <bpmn2:errorEventDefinition errorRef="Error_Sink5xx"/>
+      </bpmn2:startEvent>
+
+      <!-- Backoff controller: increments retryCount, sleeps, sets maxRetriesExceeded -->
+      <bpmn2:scriptTask id="Task_Backoff" name="Exponential Backoff&#10;(1s → 2s → 4s)"
+                        scriptFormat="groovy"
+                        ifl:scriptName="retryWithBackoff.groovy">
+        <bpmn2:incoming>Flow_ErrStart_to_Backoff</bpmn2:incoming>
+        <bpmn2:outgoing>Flow_Backoff_to_Gate</bpmn2:outgoing>
+      </bpmn2:scriptTask>
+
+      <!-- Gateway: retry or route to DLQ -->
+      <bpmn2:exclusiveGateway id="GW_RetryOrDLQ" name="maxRetriesExceeded?">
+        <bpmn2:incoming>Flow_Backoff_to_Gate</bpmn2:incoming>
+        <bpmn2:outgoing>Flow_Gate_Retry</bpmn2:outgoing>
+        <bpmn2:outgoing>Flow_Gate_DLQ</bpmn2:outgoing>
+      </bpmn2:exclusiveGateway>
+
+      <!-- Loop back: re-call HTTP POST -->
+      <bpmn2:serviceTask id="Task_RetryPost" name="Retry HTTP POST"
+                         ifl:componentType="HTTPRequest">
+        <bpmn2:extensionElements>
+          <ifl:property><ifl:key>address</ifl:key><ifl:value>{{sink_url}}/events/discovery</ifl:value></ifl:property>
+          <ifl:property><ifl:key>method</ifl:key><ifl:value>POST</ifl:value></ifl:property>
+          <ifl:property><ifl:key>timeout</ifl:key><ifl:value>10000</ifl:value></ifl:property>
+          <ifl:property><ifl:key>credentialName</ifl:key><ifl:value>s4a_sink_credentials</ifl:value></ifl:property>
+        </bpmn2:extensionElements>
+        <bpmn2:incoming>Flow_Gate_Retry</bpmn2:incoming>
+        <bpmn2:outgoing>Flow_RetryPost_to_End</bpmn2:outgoing>
+      </bpmn2:serviceTask>
+
+      <!-- Build DLQ payload -->
+      <bpmn2:scriptTask id="Task_BuildDlq" name="Build discovery.failed payload"
+                        scriptFormat="groovy"
+                        ifl:scriptName="publishToDlq.groovy">
+        <bpmn2:incoming>Flow_Gate_DLQ</bpmn2:incoming>
+        <bpmn2:outgoing>Flow_BuildDlq_to_Publish</bpmn2:outgoing>
+      </bpmn2:scriptTask>
+
+      <!-- Publish to DLQ topic via Event Mesh outbound adapter -->
+      <bpmn2:serviceTask id="Task_PublishDlq" name="Publish to DLQ&#10;s4a/{tenantId}/discovery/failed"
+                         ifl:componentType="EventMeshPublisher">
+        <bpmn2:extensionElements>
+          <ifl:property>
+            <ifl:key>topicExpression</ifl:key>
+            <!-- Topic resolved at runtime from message property set by publishToDlq.groovy -->
+            <ifl:value>${property.dlqTopic}</ifl:value>
+          </ifl:property>
+          <ifl:property>
+            <ifl:key>qos</ifl:key>
+            <ifl:value>1</ifl:value>
+          </ifl:property>
+          <ifl:property>
+            <ifl:key>credentialName</ifl:key>
+            <ifl:value>s4a_eventmesh_credentials</ifl:value>
+          </ifl:property>
+        </bpmn2:extensionElements>
+        <bpmn2:incoming>Flow_BuildDlq_to_Publish</bpmn2:incoming>
+        <bpmn2:outgoing>Flow_Publish_to_DLQEnd</bpmn2:outgoing>
+      </bpmn2:serviceTask>
+
+      <bpmn2:endEvent id="EndEvent_DLQ" name="Routed to DLQ">
+        <bpmn2:incoming>Flow_Publish_to_DLQEnd</bpmn2:incoming>
+      </bpmn2:endEvent>
+
+      <bpmn2:endEvent id="EndEvent_RetryOK" name="Retry succeeded">
+        <bpmn2:incoming>Flow_RetryPost_to_End</bpmn2:incoming>
+      </bpmn2:endEvent>
+
+      <!-- Sub-process flows -->
+      <bpmn2:sequenceFlow id="Flow_ErrStart_to_Backoff"  sourceRef="ErrorStart_Retry"  targetRef="Task_Backoff"/>
+      <bpmn2:sequenceFlow id="Flow_Backoff_to_Gate"      sourceRef="Task_Backoff"       targetRef="GW_RetryOrDLQ"/>
+      <bpmn2:sequenceFlow id="Flow_Gate_Retry"           sourceRef="GW_RetryOrDLQ"      targetRef="Task_RetryPost">
+        <bpmn2:conditionExpression>${property.maxRetriesExceeded == 'false'}</bpmn2:conditionExpression>
+      </bpmn2:sequenceFlow>
+      <bpmn2:sequenceFlow id="Flow_Gate_DLQ"             sourceRef="GW_RetryOrDLQ"      targetRef="Task_BuildDlq">
+        <bpmn2:conditionExpression>${property.maxRetriesExceeded == 'true'}</bpmn2:conditionExpression>
+      </bpmn2:sequenceFlow>
+      <bpmn2:sequenceFlow id="Flow_RetryPost_to_End"     sourceRef="Task_RetryPost"     targetRef="EndEvent_RetryOK"/>
+      <bpmn2:sequenceFlow id="Flow_BuildDlq_to_Publish"  sourceRef="Task_BuildDlq"      targetRef="Task_PublishDlq"/>
+      <bpmn2:sequenceFlow id="Flow_Publish_to_DLQEnd"    sourceRef="Task_PublishDlq"    targetRef="EndEvent_DLQ"/>
+    </bpmn2:subProcess>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         VALIDATION ERROR SUB-PROCESS
+         Catches HMAC / schema exceptions and routes directly to DLQ
+         (no retries — these are permanent failures, not transient)
+         ═══════════════════════════════════════════════════════════════ -->
+    <bpmn2:subProcess id="SubProcess_ValidationDLQ" name="Validation Error → DLQ"
+                      triggeredByEvent="true">
+
+      <bpmn2:startEvent id="ErrorStart_Validation" name="HMAC or Schema error">
+        <bpmn2:outgoing>Flow_ValErr_to_BuildDlq</bpmn2:outgoing>
+        <bpmn2:errorEventDefinition errorRef="Error_Validation"/>
+      </bpmn2:startEvent>
+
+      <bpmn2:scriptTask id="Task_ValBuildDlq" name="Build discovery.failed payload"
+                        scriptFormat="groovy"
+                        ifl:scriptName="publishToDlq.groovy">
+        <bpmn2:incoming>Flow_ValErr_to_BuildDlq</bpmn2:incoming>
+        <bpmn2:outgoing>Flow_ValBuildDlq_to_Publish</bpmn2:outgoing>
+      </bpmn2:scriptTask>
+
+      <bpmn2:serviceTask id="Task_ValPublishDlq" name="Publish to DLQ"
+                         ifl:componentType="EventMeshPublisher">
+        <bpmn2:extensionElements>
+          <ifl:property><ifl:key>topicExpression</ifl:key><ifl:value>${property.dlqTopic}</ifl:value></ifl:property>
+          <ifl:property><ifl:key>qos</ifl:key><ifl:value>1</ifl:value></ifl:property>
+          <ifl:property><ifl:key>credentialName</ifl:key><ifl:value>s4a_eventmesh_credentials</ifl:value></ifl:property>
+        </bpmn2:extensionElements>
+        <bpmn2:incoming>Flow_ValBuildDlq_to_Publish</bpmn2:incoming>
+        <bpmn2:outgoing>Flow_ValPublish_to_End</bpmn2:outgoing>
+      </bpmn2:serviceTask>
+
+      <bpmn2:endEvent id="EndEvent_ValDLQ" name="Validation failure in DLQ">
+        <bpmn2:incoming>Flow_ValPublish_to_End</bpmn2:incoming>
+      </bpmn2:endEvent>
+
+      <bpmn2:sequenceFlow id="Flow_ValErr_to_BuildDlq"       sourceRef="ErrorStart_Validation" targetRef="Task_ValBuildDlq"/>
+      <bpmn2:sequenceFlow id="Flow_ValBuildDlq_to_Publish"   sourceRef="Task_ValBuildDlq"      targetRef="Task_ValPublishDlq"/>
+      <bpmn2:sequenceFlow id="Flow_ValPublish_to_End"        sourceRef="Task_ValPublishDlq"    targetRef="EndEvent_ValDLQ"/>
+    </bpmn2:subProcess>
+
+  </bpmn2:process>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       ERROR DEFINITIONS
+       ═══════════════════════════════════════════════════════════════════ -->
+  <bpmn2:error id="Error_Sink5xx"   name="SinkHTTPError"  errorCode="HTTP_5XX"/>
+  <bpmn2:error id="Error_Validation" name="ValidationError" errorCode="VALIDATION_ERROR"/>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       DIAGRAM — layout coordinates (required for Integration Suite import)
+       ═══════════════════════════════════════════════════════════════════ -->
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Collaboration_1">
+
+      <bpmndi:BPMNShape id="Shape_Participant_Integration" bpmnElement="Participant_Integration" isHorizontal="true">
+        <dc:Bounds x="130" y="80" width="1200" height="400"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_Participant_EM_Source" bpmnElement="Participant_EM_Source" isHorizontal="true">
+        <dc:Bounds x="130" y="20" width="200" height="60"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_Participant_Sink" bpmnElement="Participant_Sink" isHorizontal="true">
+        <dc:Bounds x="1330" y="80" width="160" height="200"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_Participant_DLQ" bpmnElement="Participant_DLQ" isHorizontal="true">
+        <dc:Bounds x="1330" y="300" width="160" height="180"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Happy path shapes -->
+      <bpmndi:BPMNShape id="Shape_StartEvent_1"        bpmnElement="StartEvent_1">        <dc:Bounds x="192" y="192" width="36" height="36"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_Task_VerifyHmac"     bpmnElement="Task_VerifyHmac">     <dc:Bounds x="280" y="170" width="120" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_Task_ValidateSchema" bpmnElement="Task_ValidateSchema"> <dc:Bounds x="450" y="170" width="120" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_Task_EnrichPayload"  bpmnElement="Task_EnrichPayload">  <dc:Bounds x="620" y="170" width="120" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_Task_HttpPost"       bpmnElement="Task_HttpPost">       <dc:Bounds x="790" y="170" width="120" height="80"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_EndEvent_Success"    bpmnElement="EndEvent_Success">    <dc:Bounds x="962" y="192" width="36" height="36"/></bpmndi:BPMNShape>
+
+      <!-- Error sub-process shapes -->
+      <bpmndi:BPMNShape id="Shape_SubProcess_RetryDLQ" bpmnElement="SubProcess_RetryDLQ" isExpanded="true">
+        <dc:Bounds x="280" y="290" width="960" height="160"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_SubProcess_ValidationDLQ" bpmnElement="SubProcess_ValidationDLQ" isExpanded="true">
+        <dc:Bounds x="280" y="460" width="700" height="120"/>
+      </bpmndi:BPMNShape>
+
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+
+</bpmn2:definitions>

@@ -1,0 +1,14 @@
+{
+  "name": "s4a-discovery-consumer",
+  "version": "1.0.0",
+  "description": "Webhook sink that receives enriched discovery events from CPI",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "start:fail": "FORCE_ERROR=true node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.3",
+    "dotenv": "^16.4.5"
+  }
+}

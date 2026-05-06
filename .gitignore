@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Environment files — contain secrets, never commit
+.env
+publisher/.env
+consumer/.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
